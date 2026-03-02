@@ -102,5 +102,5 @@ python ide_injector.py restore --file app/service.py
 - **Critical enforcement**: The workflow step `Enforce critical issues` calls `exit 1` if `critical_count > 0`, blocking merge until resolved.
 
 ### GitHub repo
-- **Remote**: `https://github.com/egana85/claude-copilot-integration`
+- **Remote**: `https://github.com/reloncavi/claude-copilot-integration`
 - **Secret required**: `ANTHROPIC_API_KEY` must be set in repo Settings → Secrets → Actions.
