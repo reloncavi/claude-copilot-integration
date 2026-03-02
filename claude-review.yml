@@ -1,0 +1,234 @@
+# =============================================================================
+# .github/workflows/claude-review.yml — Revisión Automática de PRs con Claude
+# Proyecto: Claude + Copilot Integration | Fase 3 — CI/CD Integration
+# Trigger: Cada Pull Request (opened, synchronize, reopened)
+# Flujo: Extraer diff → Filtrar archivos relevantes → Claude revisa → Postear en PR
+# KPIs: < 90 segundos de revisión | < $5 USD/día en tokens
+# =============================================================================
+
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '**.py'
+      - '**.ts'
+      - '**.js'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Cancelar revisiones anteriores si llegan nuevos commits al mismo PR
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.12'
+  MAX_DIFF_SIZE: 5000
+  REVIEW_TIMEOUT: 60
+
+jobs:
+  review:
+    name: Claude Review
+    runs-on: ubuntu-latest
+    if: |
+      github.actor != 'dependabot[bot]' &&
+      github.actor != 'renovate[bot]'
+    timeout-minutes: 5
+
+    steps:
+      # -----------------------------------------------------------------------
+      # PASO 1: Checkout con historial completo para poder hacer diff
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # -----------------------------------------------------------------------
+      # PASO 2: Setup Python
+      # -----------------------------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      # -----------------------------------------------------------------------
+      # PASO 3: Instalar dependencias
+      # -----------------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          pip install anthropic redis
+          python -c "import anthropic; print(f'anthropic SDK {anthropic.__version__} OK')"
+
+      # -----------------------------------------------------------------------
+      # PASO 4: Extraer diff del PR (solo .py, .ts, .js — sin migrations ni locks)
+      # -----------------------------------------------------------------------
+      - name: Extract PR diff
+        id: diff
+        run: |
+          git diff \
+            origin/${{ github.event.pull_request.base.ref }}...${{ github.event.pull_request.head.sha }} \
+            -- '*.py' '*.ts' '*.js' \
+            ':!**/migrations/**' \
+            ':!**/node_modules/**' \
+            ':!**/__pycache__/**' \
+            ':!*.lock' \
+            ':!**/tests/fixtures/**' \
+            > /tmp/pr.diff
+
+          DIFF_SIZE=$(wc -c < /tmp/pr.diff)
+          echo "diff_size=$DIFF_SIZE" >> $GITHUB_OUTPUT
+          echo "📏 Diff size: $DIFF_SIZE bytes"
+
+          if [ "$DIFF_SIZE" -eq 0 ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "⏭️ No hay cambios de código relevantes"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+          # Truncar si excede el límite para no gastar tokens demás
+          if [ "$DIFF_SIZE" -gt "${{ env.MAX_DIFF_SIZE }}" ]; then
+            echo "truncated=true" >> $GITHUB_OUTPUT
+            echo "⚠️ Diff truncado: $DIFF_SIZE > ${{ env.MAX_DIFF_SIZE }} chars"
+            head -c ${{ env.MAX_DIFF_SIZE }} /tmp/pr.diff > /tmp/pr_truncated.diff
+            mv /tmp/pr_truncated.diff /tmp/pr.diff
+          else
+            echo "truncated=false" >> $GITHUB_OUTPUT
+          fi
+
+      # -----------------------------------------------------------------------
+      # PASO 5: Ejecutar revisión con Claude (claude-haiku → económico)
+      # -----------------------------------------------------------------------
+      - name: Run Claude Review
+        if: steps.diff.outputs.skip != 'true'
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          timeout ${{ env.REVIEW_TIMEOUT }} \
+            python orchestrator.py review /tmp/pr.diff > /tmp/review.json 2>/tmp/review.log
+
+          REVIEW_EXIT=$?
+          echo "exit_code=$REVIEW_EXIT" >> $GITHUB_OUTPUT
+
+          # Log de tokens al stderr (capturado por GitHub Actions)
+          echo "--- Token usage log ---"
+          cat /tmp/review.log || true
+
+          # Validar JSON y mostrar resumen
+          python -c "
+          import json, sys
+          try:
+              with open('/tmp/review.json') as f:
+                  data = json.load(f)
+              print(f'✅ Revisión OK: {len(data)} issue(s)')
+              for sev in ['critical', 'warning', 'suggestion']:
+                  n = sum(1 for i in data if i.get('severity') == sev)
+                  if n: print(f'   {sev}: {n}')
+          except json.JSONDecodeError as e:
+              print(f'❌ JSON inválido: {e}', file=sys.stderr)
+              with open('/tmp/review.json', 'w') as f:
+                  json.dump([], f)
+          "
+
+      # -----------------------------------------------------------------------
+      # PASO 6: Postear resumen en el PR (UN solo comentario, no spam)
+      # -----------------------------------------------------------------------
+      - name: Post Review Comment
+        if: steps.diff.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            let review;
+            try {
+              review = JSON.parse(fs.readFileSync('/tmp/review.json', 'utf8'));
+            } catch (e) {
+              console.log('No se pudo leer review.json:', e.message);
+              return;
+            }
+
+            const severityEmoji = {
+              critical:   '🔴',
+              warning:    '🟡',
+              suggestion: '🔵'
+            };
+
+            // Sin issues → comentario positivo breve
+            if (!review || review.length === 0) {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body: '🤖 **Claude Review** — ✅ Sin issues encontrados. ¡Buen trabajo!'
+              });
+              return;
+            }
+
+            // Construir comentario agrupado por severidad
+            let body = '🤖 **Claude Code Review**\n\n';
+            body += `Se encontraron **${review.length} issue(s)**:\n\n`;
+
+            for (const sev of ['critical', 'warning', 'suggestion']) {
+              const items = review.filter(i => i.severity === sev);
+              if (!items.length) continue;
+
+              body += `### ${severityEmoji[sev]} ${sev.toUpperCase()} (${items.length})\n\n`;
+              for (const item of items) {
+                body += `- **${item.issue}**\n`;
+                body += `  > 💡 ${item.suggestion}\n\n`;
+              }
+            }
+
+            const truncated = '${{ steps.diff.outputs.truncated }}';
+            if (truncated === 'true') {
+              body += '\n---\n⚠️ *Diff truncado — algunos cambios no fueron revisados.*\n';
+            }
+
+            body += '\n---\n*Revisado por Claude (haiku) vía [orchestrator.py](./orchestrator.py)*';
+
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+            // Fallar el check si hay issues críticos (descomentar para enforcing)
+            // const criticals = review.filter(i => i.severity === 'critical');
+            // if (criticals.length > 0) {
+            //   core.setFailed(`${criticals.length} issue(s) crítico(s) encontrados`);
+            // }
+
+      # -----------------------------------------------------------------------
+      # PASO 7: Comentario si no hay diff relevante
+      # -----------------------------------------------------------------------
+      - name: Post Skip Comment
+        if: steps.diff.outputs.skip == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body: '🤖 **Claude Review** — ⏭️ Sin cambios en archivos de código (.py/.ts/.js). Revisión omitida.'
+            });
+
+      # -----------------------------------------------------------------------
+      # PASO 8: Exportar métricas de tokens (para Grafana/Datadog en Fase 4)
+      # -----------------------------------------------------------------------
+      - name: Report Token Metrics
+        if: always() && steps.diff.outputs.skip != 'true'
+        run: |
+          echo "📊 Token Usage:"
+          cat /tmp/review.log || echo "Sin log de tokens"
+          # TODO Fase 4: enviar a Datadog
+          # curl -X POST "$DATADOG_METRICS_URL" -d @/tmp/token_metrics.json
