@@ -1023,6 +1023,7 @@ class ReviewReporter:
                 'failure': 0,
                 'cancelled': 0,
                 'in_progress': 0,
+                'queued': 0,
             },
             'review_summary': {
                 'total_prs_checked': 0,
@@ -1041,11 +1042,14 @@ class ReviewReporter:
         runs = self.fetch_workflow_runs(limit=pr_limit)
         report['workflow_stats']['total_runs'] = len(runs)
         for run in runs:
-            # GitHub API: 'conclusion' is 'success'|'failure'|'cancelled'|null
-            # 'status' is 'completed'|'in_progress'|'queued'. Prefer conclusion.
-            conclusion = run.get('conclusion') or run.get('status', '')
-            if conclusion in report['workflow_stats']:
-                report['workflow_stats'][conclusion] += 1
+            # GitHub API: 'conclusion' is 'success'|'failure'|'cancelled'|null.
+            # 'status' is 'completed'|'in_progress'|'queued'.
+            # For completed runs, use conclusion; for pending runs, use status.
+            conclusion = run.get('conclusion')
+            status = run.get('status', '')
+            key = conclusion if conclusion else status
+            if key in report['workflow_stats']:
+                report['workflow_stats'][key] += 1
 
         report['recent_workflow_runs'] = [
             {

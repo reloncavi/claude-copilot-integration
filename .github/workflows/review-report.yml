@@ -94,12 +94,12 @@ jobs:
         if: always()
         run: |
           python -c "
-          import json, os
+          import json, os, sys
           try:
               with open('/tmp/review_report.json') as f:
                   data = json.load(f)
-          except Exception:
-              print('No se pudo leer el reporte JSON', file=__import__('sys').stderr)
+          except Exception as exc:
+              print(f'No se pudo leer el reporte JSON: {exc}', file=sys.stderr)
               exit(0)
 
           rs = data['review_summary']
