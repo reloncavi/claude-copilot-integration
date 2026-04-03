@@ -107,6 +107,50 @@ cc invalidate-cache
 
 ---
 
+### `report` — Estado de revisiones de agentes autónomos
+
+Consulta la API de GitHub para obtener un resumen de cómo van las revisiones automáticas de Claude en los PRs del repositorio.
+
+```bash
+# Reporte formateado en consola
+cc report
+
+# Reporte en JSON (para scripts o integración con otras herramientas)
+cc report --json
+```
+
+**Requiere:**
+- `GITHUB_TOKEN` (o `GH_TOKEN`) — token con permisos `read:repo` y `read:actions`
+- `GITHUB_REPOSITORY` — en formato `owner/repo`
+
+**Salida de ejemplo:**
+
+```
+==============================================================
+  📊 Estado de Revisiones — Agentes Autónomos
+  Repositorio: reloncavi/claude-copilot-integration
+  Generado:    2026-04-03T19:49:00+00:00
+==============================================================
+
+⚙️  WORKFLOW (claude-review.yml)
+   Total ejecuciones:  12
+   ✅  Exitosas:       10
+   ❌  Fallidas:        2
+   🔄  En progreso:     0
+
+📈 REVISIONES DE CÓDIGO (últimos 20 PRs)
+   PRs con revisión:    8
+   ✅  Sin issues:       5
+   🔴  Con críticos:     1
+   🟡  Con warnings:     2
+   🔵  Con sugerencias:  3
+   ⏭️   Omitidas:         1
+```
+
+También se puede ejecutar automáticamente cada lunes via el workflow `.github/workflows/review-report.yml`, que publica el reporte en el GitHub Actions Summary.
+
+---
+
 ## IDE Injector (`ide_injector.py`)
 
 Gestión avanzada de bloques de pseudocódigo inyectados en archivos.
