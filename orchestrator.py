@@ -14,6 +14,8 @@ import asyncio
 import subprocess
 import re
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Literal, Optional
 from dataclasses import dataclass, field, asdict
@@ -908,6 +910,259 @@ class DiffExtractor:
         return filtered
 
 
+
+# =============================================================================
+# REVIEW REPORTER
+# Consulta la API de GitHub para generar un reporte del estado de revisiones
+# autónomas de Claude en el repositorio.
+# =============================================================================
+
+class ReviewReporter:
+    """
+    Genera un reporte del estado de las revisiones automáticas de Claude.
+    Consulta la API de GitHub para obtener métricas de revisiones recientes.
+
+    Requiere:
+        GITHUB_TOKEN (o GH_TOKEN): token con permisos read:repo y read:actions
+        GITHUB_REPOSITORY:         formato 'owner/repo' (disponible en Actions)
+    """
+
+    GITHUB_API = 'https://api.github.com'
+    CLAUDE_COMMENT_PREFIX = '🤖 **Claude'
+    WORKFLOW_FILE = 'claude-review.yml'
+
+    def __init__(self, github_token: str, repository: str):
+        self.github_token = github_token
+        self.repository = repository
+
+    def _api_get(self, path: str) -> object:
+        """Realiza GET a la API de GitHub y retorna el JSON parseado."""
+        url = f"{self.GITHUB_API}{path}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                'Authorization': f'Bearer {self.github_token}',
+                'Accept': 'application/vnd.github.v3+json',
+                'X-GitHub-Api-Version': '2022-11-28',
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            raise OrchestratorAPIError(
+                f"GitHub API error {e.code} en {path}: {e.reason}"
+            ) from e
+        except Exception as e:
+            raise OrchestratorAPIError(
+                f"Error consultando GitHub API ({path}): {e}"
+            ) from e
+
+    def fetch_workflow_runs(self, limit: int = 20) -> list[dict]:
+        """Obtiene las ejecuciones recientes del workflow de revisión."""
+        try:
+            data = self._api_get(
+                f"/repos/{self.repository}/actions/workflows"
+                f"/{self.WORKFLOW_FILE}/runs?per_page={limit}"
+            )
+            return data.get('workflow_runs', []) if isinstance(data, dict) else []
+        except OrchestratorAPIError as e:
+            logger.warning(f"No se pudieron obtener workflow runs: {e}")
+            return []
+
+    def fetch_recent_prs(self, limit: int = 20) -> list[dict]:
+        """Obtiene los PRs más recientes (abiertos y cerrados)."""
+        try:
+            data = self._api_get(
+                f"/repos/{self.repository}/pulls"
+                f"?state=all&per_page={limit}&sort=updated&direction=desc"
+            )
+            return data if isinstance(data, list) else []
+        except OrchestratorAPIError as e:
+            logger.warning(f"No se pudieron obtener PRs: {e}")
+            return []
+
+    def fetch_pr_comments(self, pr_number: int) -> list[dict]:
+        """Obtiene los comentarios de un PR."""
+        try:
+            data = self._api_get(
+                f"/repos/{self.repository}/issues/{pr_number}/comments?per_page=100"
+            )
+            return data if isinstance(data, list) else []
+        except OrchestratorAPIError as e:
+            logger.warning(f"No se pudieron obtener comentarios del PR #{pr_number}: {e}")
+            return []
+
+    def _parse_claude_comment(self, body: str) -> dict:
+        """Extrae métricas de un comentario de Claude."""
+        return {
+            'clean': '✅ Sin issues' in body,
+            'has_critical': '🔴' in body,
+            'has_warnings': '🟡' in body,
+            'has_suggestions': '🔵' in body,
+            'skipped': '⏭️' in body,
+        }
+
+    def generate_report(self, pr_limit: int = 20) -> dict:
+        """
+        Genera un reporte completo del estado de las revisiones autónomas.
+
+        Returns:
+            dict con campos: generated_at, repository, workflow_stats,
+            review_summary, recent_reviews.
+        """
+        report: dict = {
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+            'repository': self.repository,
+            'workflow_stats': {
+                'total_runs': 0,
+                'success': 0,
+                'failure': 0,
+                'cancelled': 0,
+                'in_progress': 0,
+            },
+            'review_summary': {
+                'total_prs_checked': 0,
+                'prs_with_review': 0,
+                'clean_reviews': 0,
+                'critical_found': 0,
+                'warnings_found': 0,
+                'suggestions_found': 0,
+                'skipped_reviews': 0,
+            },
+            'recent_reviews': [],
+            'recent_workflow_runs': [],
+        }
+
+        # ── Workflow runs ──────────────────────────────────────────────────────
+        runs = self.fetch_workflow_runs(limit=pr_limit)
+        report['workflow_stats']['total_runs'] = len(runs)
+        for run in runs:
+            conclusion = run.get('conclusion') or run.get('status', '')
+            if conclusion in report['workflow_stats']:
+                report['workflow_stats'][conclusion] += 1
+            elif conclusion == 'completed':
+                report['workflow_stats']['success'] += 1
+
+        report['recent_workflow_runs'] = [
+            {
+                'run_id': r['id'],
+                'status': r.get('status'),
+                'conclusion': r.get('conclusion'),
+                'created_at': r['created_at'],
+                'html_url': r['html_url'],
+                'pr_number': (
+                    r['pull_requests'][0]['number']
+                    if r.get('pull_requests') else None
+                ),
+            }
+            for r in runs[:10]
+        ]
+
+        # ── PR review comments ─────────────────────────────────────────────────
+        prs = self.fetch_recent_prs(limit=pr_limit)
+        report['review_summary']['total_prs_checked'] = len(prs)
+
+        for pr in prs:
+            pr_number = pr['number']
+            comments = self.fetch_pr_comments(pr_number)
+
+            claude_comment = next(
+                (
+                    c for c in comments
+                    if c.get('body', '').startswith(self.CLAUDE_COMMENT_PREFIX)
+                ),
+                None,
+            )
+
+            if not claude_comment:
+                continue
+
+            metrics = self._parse_claude_comment(claude_comment['body'])
+            report['review_summary']['prs_with_review'] += 1
+
+            if metrics['clean']:
+                report['review_summary']['clean_reviews'] += 1
+            if metrics['has_critical']:
+                report['review_summary']['critical_found'] += 1
+            if metrics['has_warnings']:
+                report['review_summary']['warnings_found'] += 1
+            if metrics['has_suggestions']:
+                report['review_summary']['suggestions_found'] += 1
+            if metrics['skipped']:
+                report['review_summary']['skipped_reviews'] += 1
+
+            report['recent_reviews'].append({
+                'pr_number': pr_number,
+                'pr_title': pr['title'],
+                'pr_state': pr['state'],
+                'pr_url': pr['html_url'],
+                'reviewed_at': claude_comment['updated_at'],
+                **metrics,
+            })
+
+        return report
+
+    def print_report(self, report: dict) -> None:
+        """Imprime un reporte formateado al stdout."""
+        bar = '=' * 62
+        print(f"\n{bar}")
+        print(f"  📊 Estado de Revisiones — Agentes Autónomos")
+        print(f"  Repositorio: {report['repository']}")
+        print(f"  Generado:    {report['generated_at']}")
+        print(f"{bar}")
+
+        ws = report['workflow_stats']
+        print(f"\n⚙️  WORKFLOW ({self.WORKFLOW_FILE})")
+        print(f"   Total ejecuciones:  {ws['total_runs']}")
+        if ws['total_runs']:
+            print(f"   ✅  Exitosas:       {ws['success']}")
+            print(f"   ❌  Fallidas:       {ws['failure']}")
+            print(f"   🔄  En progreso:    {ws['in_progress']}")
+
+        rs = report['review_summary']
+        print(f"\n📈 REVISIONES DE CÓDIGO (últimos {rs['total_prs_checked']} PRs)")
+        print(f"   PRs con revisión:   {rs['prs_with_review']}")
+        print(f"   ✅  Sin issues:      {rs['clean_reviews']}")
+        print(f"   🔴  Con críticos:    {rs['critical_found']}")
+        print(f"   🟡  Con warnings:    {rs['warnings_found']}")
+        print(f"   🔵  Con sugerencias: {rs['suggestions_found']}")
+        print(f"   ⏭️   Omitidas:        {rs['skipped_reviews']}")
+
+        if report['recent_reviews']:
+            print(f"\n📋 DETALLE DE REVISIONES RECIENTES:")
+            for rev in report['recent_reviews']:
+                icons: list[str] = []
+                if rev['clean']:
+                    icons.append('✅')
+                if rev['has_critical']:
+                    icons.append('🔴')
+                if rev['has_warnings']:
+                    icons.append('🟡')
+                if rev['has_suggestions']:
+                    icons.append('🔵')
+                if rev['skipped']:
+                    icons.append('⏭️')
+                status = ' '.join(icons) or '⚪'
+                state_label = '🟢' if rev['pr_state'] == 'open' else '🔒'
+                title = rev['pr_title'][:45] + ('…' if len(rev['pr_title']) > 45 else '')
+                print(f"   {state_label} PR #{rev['pr_number']:>4}  {status}  {title}")
+
+        if report['recent_workflow_runs']:
+            print(f"\n⏱️  ÚLTIMAS EJECUCIONES:")
+            conclusion_icon = {
+                'success': '✅', 'failure': '❌', 'cancelled': '⚪',
+                'in_progress': '🔄', 'queued': '⏳',
+            }
+            for run in report['recent_workflow_runs'][:5]:
+                conclusion = run.get('conclusion') or run.get('status') or '?'
+                icon = conclusion_icon.get(conclusion, '❓')
+                pr_info = f" → PR #{run['pr_number']}" if run['pr_number'] else ''
+                print(f"   {icon}  Run #{run['run_id']}{pr_info} [{conclusion}]")
+
+        print(f"\n{bar}\n")
+
+
 # =============================================================================
 # CLI PRINCIPAL
 # =============================================================================
@@ -927,7 +1182,8 @@ async def main() -> None:
             "  python orchestrator.py design <requerimiento> [archivo_destino]\n"
             "  python orchestrator.py review <archivo.diff | rama_base>\n"
             "  python orchestrator.py review-batch\n"
-            "  python orchestrator.py invalidate-cache\n",
+            "  python orchestrator.py invalidate-cache\n"
+            "  python orchestrator.py report [--json]\n",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1018,6 +1274,47 @@ async def main() -> None:
         elif command == 'invalidate-cache':
             await cache.invalidate()
             print("✅ Cache del system prompt invalidado.")
+
+        # ------------------------------------------------------------------
+        # COMANDO: report
+        # Estado de revisiones de agentes autónomos vía GitHub API.
+        # Requiere: GITHUB_TOKEN (o GH_TOKEN) y GITHUB_REPOSITORY env vars.
+        # ------------------------------------------------------------------
+        elif command == 'report':
+            output_json = '--json' in sys.argv
+
+            github_token = (
+                os.environ.get('GITHUB_TOKEN')
+                or os.environ.get('GH_TOKEN')
+            )
+            repository = os.environ.get('GITHUB_REPOSITORY')
+
+            if not github_token:
+                logger.error(
+                    "❌ GITHUB_TOKEN (o GH_TOKEN) no definida. "
+                    "Define la variable de entorno para consultar la API de GitHub."
+                )
+                sys.exit(1)
+
+            if not repository:
+                logger.error(
+                    "❌ GITHUB_REPOSITORY no definida. "
+                    "Formato esperado: 'owner/repo'."
+                )
+                sys.exit(1)
+
+            reporter = ReviewReporter(
+                github_token=github_token,
+                repository=repository,
+            )
+
+            logger.info(f"📡 Consultando API de GitHub para '{repository}'...")
+            report_data = reporter.generate_report()
+
+            if output_json:
+                print(json.dumps(report_data, indent=2, ensure_ascii=False))
+            else:
+                reporter.print_report(report_data)
 
         else:
             logger.error(f"Comando desconocido: '{command}'")

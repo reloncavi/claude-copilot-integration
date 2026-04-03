@@ -1,0 +1,158 @@
+# =============================================================================
+# .github/workflows/review-report.yml — Reporte de Revisiones Autónomas
+# Proyecto: Claude + Copilot Integration
+# Trigger: semanal (lunes 08:00 UTC) o manual vía workflow_dispatch
+# Flujo: Consultar GitHub API → Generar reporte → Postear en Discussions/Summary
+# =============================================================================
+
+name: Reporte de Revisiones Autónomas
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'   # Lunes 08:00 UTC
+  workflow_dispatch:
+    inputs:
+      pr_limit:
+        description: 'Número de PRs a analizar'
+        required: false
+        default: '20'
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+env:
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  report:
+    name: Reporte de Revisiones
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # -----------------------------------------------------------------------
+      # PASO 1: Checkout
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # PASO 2: Setup Python
+      # -----------------------------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      # -----------------------------------------------------------------------
+      # PASO 3: Instalar dependencias mínimas
+      # -----------------------------------------------------------------------
+      - name: Install dependencies
+        run: pip install anthropic python-dotenv
+
+      # -----------------------------------------------------------------------
+      # PASO 4: Generar reporte de revisiones autónomas
+      # -----------------------------------------------------------------------
+      - name: Generate review report
+        env:
+          # ANTHROPIC_API_KEY es requerida por OrchestratorConfig.from_env()
+          # pero el comando 'report' no realiza llamadas a la API de Anthropic.
+          # Usamos un valor placeholder para satisfacer la validación de config.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || 'placeholder-not-used' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python orchestrator.py report | tee /tmp/review_report.txt
+          echo "---"
+          echo "Reporte generado exitosamente"
+
+      # -----------------------------------------------------------------------
+      # PASO 5: Exportar reporte como JSON (para uso en otros pasos)
+      # -----------------------------------------------------------------------
+      - name: Export JSON report
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || 'placeholder-not-used' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python orchestrator.py report --json > /tmp/review_report.json
+          echo "📊 Resumen JSON:"
+          python -c "
+          import json
+          with open('/tmp/review_report.json') as f:
+              data = json.load(f)
+          rs = data['review_summary']
+          ws = data['workflow_stats']
+          print(f\"PRs revisados: {rs['prs_with_review']} / {rs['total_prs_checked']}\")
+          print(f\"Sin issues: {rs['clean_reviews']}\")
+          print(f\"Con críticos: {rs['critical_found']}\")
+          print(f\"Workflow runs: {ws['total_runs']} (exitosos: {ws['success']}, fallidos: {ws['failure']})\")
+          "
+
+      # -----------------------------------------------------------------------
+      # PASO 6: Publicar reporte en GitHub Actions Summary
+      # -----------------------------------------------------------------------
+      - name: Publish to Job Summary
+        if: always()
+        run: |
+          python -c "
+          import json, os
+          try:
+              with open('/tmp/review_report.json') as f:
+                  data = json.load(f)
+          except Exception:
+              print('No se pudo leer el reporte JSON', file=__import__('sys').stderr)
+              exit(0)
+
+          rs = data['review_summary']
+          ws = data['workflow_stats']
+          repo = data['repository']
+          generated = data['generated_at']
+
+          lines = [
+              '## 📊 Revisiones de Agentes Autónomos',
+              f'**Repositorio:** \`{repo}\`  ',
+              f'**Generado:** {generated}',
+              '',
+              '### ⚙️ Workflow (\`claude-review.yml\`)',
+              f'| Métrica | Valor |',
+              f'|---|---|',
+              f'| Total ejecuciones | {ws[\"total_runs\"]} |',
+              f'| ✅ Exitosas | {ws[\"success\"]} |',
+              f'| ❌ Fallidas | {ws[\"failure\"]} |',
+              f'| 🔄 En progreso | {ws[\"in_progress\"]} |',
+              '',
+              '### 📈 Revisiones de Código',
+              f'| Métrica | Valor |',
+              f'|---|---|',
+              f'| PRs analizados | {rs[\"total_prs_checked\"]} |',
+              f'| PRs con revisión | {rs[\"prs_with_review\"]} |',
+              f'| ✅ Sin issues | {rs[\"clean_reviews\"]} |',
+              f'| 🔴 Con críticos | {rs[\"critical_found\"]} |',
+              f'| 🟡 Con warnings | {rs[\"warnings_found\"]} |',
+              f'| 🔵 Con sugerencias | {rs[\"suggestions_found\"]} |',
+              f'| ⏭️ Omitidas | {rs[\"skipped_reviews\"]} |',
+          ]
+
+          if data.get('recent_reviews'):
+              lines += ['', '### 📋 Revisiones Recientes', '| PR | Estado | Título |', '|---|---|---|']
+              for rev in data['recent_reviews'][:10]:
+                  icons = []
+                  if rev.get('clean'): icons.append('✅')
+                  if rev.get('has_critical'): icons.append('🔴')
+                  if rev.get('has_warnings'): icons.append('🟡')
+                  if rev.get('has_suggestions'): icons.append('🔵')
+                  if rev.get('skipped'): icons.append('⏭️')
+                  status = ' '.join(icons) or '⚪'
+                  state = '🟢' if rev['pr_state'] == 'open' else '🔒'
+                  title = rev['pr_title'][:50]
+                  lines.append(f'| [{state} #{rev[\"pr_number\"]}]({rev[\"pr_url\"]}) | {status} | {title} |')
+
+          summary_path = os.environ['GITHUB_STEP_SUMMARY']
+          with open(summary_path, 'w') as f:
+              f.write('\n'.join(lines) + '\n')
+          print('✅ Reporte publicado en GitHub Actions Summary')
+          "
