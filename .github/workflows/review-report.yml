@@ -58,10 +58,6 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Generate review report
         env:
-          # ANTHROPIC_API_KEY es requerida por OrchestratorConfig.from_env()
-          # pero el comando 'report' no realiza llamadas a la API de Anthropic.
-          # Usamos un valor placeholder para satisfacer la validación de config.
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || 'placeholder-not-used' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
@@ -74,7 +70,6 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Export JSON report
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || 'placeholder-not-used' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |

@@ -931,11 +931,14 @@ class ReviewReporter:
     CLAUDE_COMMENT_PREFIX = '🤖 **Claude'
     WORKFLOW_FILE = 'claude-review.yml'
 
+    API_TIMEOUT_SECONDS = 15
+    TITLE_MAX_LENGTH = 45
+
     def __init__(self, github_token: str, repository: str):
         self.github_token = github_token
         self.repository = repository
 
-    def _api_get(self, path: str) -> object:
+    def _api_get(self, path: str) -> 'dict | list':
         """Realiza GET a la API de GitHub y retorna el JSON parseado."""
         url = f"{self.GITHUB_API}{path}"
         req = urllib.request.Request(
@@ -947,7 +950,7 @@ class ReviewReporter:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=self.API_TIMEOUT_SECONDS) as resp:
                 return json.loads(resp.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             raise OrchestratorAPIError(
@@ -1038,11 +1041,11 @@ class ReviewReporter:
         runs = self.fetch_workflow_runs(limit=pr_limit)
         report['workflow_stats']['total_runs'] = len(runs)
         for run in runs:
+            # GitHub API: 'conclusion' is 'success'|'failure'|'cancelled'|null
+            # 'status' is 'completed'|'in_progress'|'queued'. Prefer conclusion.
             conclusion = run.get('conclusion') or run.get('status', '')
             if conclusion in report['workflow_stats']:
                 report['workflow_stats'][conclusion] += 1
-            elif conclusion == 'completed':
-                report['workflow_stats']['success'] += 1
 
         report['recent_workflow_runs'] = [
             {
@@ -1053,7 +1056,8 @@ class ReviewReporter:
                 'html_url': r['html_url'],
                 'pr_number': (
                     r['pull_requests'][0]['number']
-                    if r.get('pull_requests') else None
+                    if r.get('pull_requests') and len(r['pull_requests']) > 0
+                    else None
                 ),
             }
             for r in runs[:10]
@@ -1145,7 +1149,8 @@ class ReviewReporter:
                     icons.append('⏭️')
                 status = ' '.join(icons) or '⚪'
                 state_label = '🟢' if rev['pr_state'] == 'open' else '🔒'
-                title = rev['pr_title'][:45] + ('…' if len(rev['pr_title']) > 45 else '')
+                max_len = self.TITLE_MAX_LENGTH
+                title = rev['pr_title'][:max_len] + ('…' if len(rev['pr_title']) > max_len else '')
                 print(f"   {state_label} PR #{rev['pr_number']:>4}  {status}  {title}")
 
         if report['recent_workflow_runs']:
@@ -1191,7 +1196,47 @@ async def main() -> None:
     command = sys.argv[1].lower()
     export_metrics = '--export-metrics' in sys.argv
 
-    # Inicializar componentes
+    # El comando 'report' no requiere la API de Anthropic — lo despachamos antes
+    # de inicializar OrchestratorConfig para que funcione sin ANTHROPIC_API_KEY.
+    if command == 'report':
+        output_json = '--json' in sys.argv
+
+        github_token = (
+            os.environ.get('GITHUB_TOKEN')
+            or os.environ.get('GH_TOKEN')
+        )
+        repository = os.environ.get('GITHUB_REPOSITORY')
+
+        if not github_token:
+            logger.error(
+                "❌ GITHUB_TOKEN (o GH_TOKEN) no definida. "
+                "Define la variable de entorno para consultar la API de GitHub."
+            )
+            sys.exit(1)
+
+        if not repository:
+            logger.error(
+                "❌ GITHUB_REPOSITORY no definida. "
+                "Formato esperado: 'owner/repo'."
+            )
+            sys.exit(1)
+
+        reporter = ReviewReporter(
+            github_token=github_token,
+            repository=repository,
+        )
+
+        logger.info(f"📡 Consultando API de GitHub para '{repository}'...")
+        report_data = reporter.generate_report()
+
+        if output_json:
+            print(json.dumps(report_data, indent=2, ensure_ascii=False))
+        else:
+            reporter.print_report(report_data)
+
+        return
+
+    # Inicializar componentes (requiere ANTHROPIC_API_KEY)
     try:
         config = OrchestratorConfig.from_env()
     except ConfigError as e:
@@ -1274,47 +1319,6 @@ async def main() -> None:
         elif command == 'invalidate-cache':
             await cache.invalidate()
             print("✅ Cache del system prompt invalidado.")
-
-        # ------------------------------------------------------------------
-        # COMANDO: report
-        # Estado de revisiones de agentes autónomos vía GitHub API.
-        # Requiere: GITHUB_TOKEN (o GH_TOKEN) y GITHUB_REPOSITORY env vars.
-        # ------------------------------------------------------------------
-        elif command == 'report':
-            output_json = '--json' in sys.argv
-
-            github_token = (
-                os.environ.get('GITHUB_TOKEN')
-                or os.environ.get('GH_TOKEN')
-            )
-            repository = os.environ.get('GITHUB_REPOSITORY')
-
-            if not github_token:
-                logger.error(
-                    "❌ GITHUB_TOKEN (o GH_TOKEN) no definida. "
-                    "Define la variable de entorno para consultar la API de GitHub."
-                )
-                sys.exit(1)
-
-            if not repository:
-                logger.error(
-                    "❌ GITHUB_REPOSITORY no definida. "
-                    "Formato esperado: 'owner/repo'."
-                )
-                sys.exit(1)
-
-            reporter = ReviewReporter(
-                github_token=github_token,
-                repository=repository,
-            )
-
-            logger.info(f"📡 Consultando API de GitHub para '{repository}'...")
-            report_data = reporter.generate_report()
-
-            if output_json:
-                print(json.dumps(report_data, indent=2, ensure_ascii=False))
-            else:
-                reporter.print_report(report_data)
 
         else:
             logger.error(f"Comando desconocido: '{command}'")
